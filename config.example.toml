@@ -1,0 +1,20 @@
+# Mail fetch config — copy to config.toml (git-ignored) and fill in.
+# Gmail App Passwords: Google Account -> Security -> 2-Step Verification -> App passwords
+# (create one app password per mailbox you want to pull from)
+
+lookback_days = 7
+subject_keywords = [
+  "payment advice", "remittance", "advice", "collection", "receipt",
+  "neft", "rtgs", "imps", "ecs", "nach", "transfer",
+]
+
+# Add one [[mailboxes]] block per mailbox.
+[[mailboxes]]
+email = "your.name@example.com"
+app_password = "CHANGE_ME"
+
+# Own-account transfer detection: regex patterns matched against the
+# remitter segment of the bank narration only (never the beneficiary alias).
+# List your company name and its short forms.
+[match]
+own_patterns = ["YOUR COMPANY NAME", "YOUR SHORT NAME"]

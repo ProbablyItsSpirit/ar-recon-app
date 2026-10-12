@@ -1,0 +1,30 @@
+# Secrets & credentials — never commit
+.streamlit/secrets.toml
+config.toml
+*.pem
+*.key
+
+# Sensitive finance data — never commit
+input/
+samples/
+data/
+auth-qr.png
+*.xlsb
+*.xls
+*.XLSX
+*.eml
+*.msg
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Env / tooling
+.env
+.playwright-mcp/
+.playwright/
+.vscode/
+.idea/
