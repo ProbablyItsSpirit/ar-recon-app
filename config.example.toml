@@ -3,6 +3,15 @@
 # (create one app password per mailbox you want to pull from)
 
 lookback_days = 7
+
+# "all" = fetch every new INBOX mail; the AI triage then segregates
+# payment advices / bank statements / junk (requires an NVIDIA key).
+# Falls back to "keywords" automatically when no key is configured.
+fetch_scope = "all"
+max_mails = 300        # per mailbox, per run
+max_mail_kb = 10240    # skip messages larger than this
+
+# Only used when fetch_scope = "keywords" (or AI key missing):
 subject_keywords = [
   "payment advice", "remittance", "advice", "collection", "receipt",
   "neft", "rtgs", "imps", "ecs", "nach", "transfer",

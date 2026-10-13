@@ -57,6 +57,8 @@ class MatchResult:
     rows: list[MatchedRow] = field(default_factory=list)
     open_balance: float | None = None
     residual: float | None = None
+    trace: list[dict] = field(default_factory=list)      # ladder for threads
+    candidates: list[str] = field(default_factory=list)  # scored customer variants
 
 
 def _base_invoice(inv: str) -> str:
@@ -158,6 +160,7 @@ def reconcile_one(rec: PaymentRecord, sap: pd.DataFrame, partners: list[str]) ->
             "needs_password": "Password-protected document — no password in registry",
             "no_amounts": rec.notes or "No payment data found",
         }[rec.status]
+        res.trace.append({"step": "Extraction", "result": "miss", "detail": res.issue})
         return res
 
     # 1) Exact invoice-number matching (strongest signal).
@@ -174,6 +177,15 @@ def reconcile_one(rec: PaymentRecord, sap: pd.DataFrame, partners: list[str]) ->
         lines.append(line)
         groups[key] = (row, lines)
 
+    if rec.invoice_lines:
+        found = [str(k) for k in groups]
+        res.trace.append({
+            "step": "Tier 1 — invoice-exact lookup", "result": "hit" if found else "miss",
+            "detail": (f"{len(found)} of {len(rec.invoice_lines)} advice line(s) found: "
+                       + ", ".join(found[:6])) if found else
+                      f"none of {len(rec.invoice_lines)} invoice no(s) exist in the aging dump",
+        })
+
     for key, (row, lines) in groups.items():
         nets = [ln.net for ln in lines if ln.net is not None]
         advice_net = round(sum(nets), 2) if nets else None
@@ -189,6 +201,16 @@ def reconcile_one(rec: PaymentRecord, sap: pd.DataFrame, partners: list[str]) ->
     res.customer, res.customer_score = customer, score
     if customer:
         res.open_balance = round(float(sap[(sap[COL_PARTNER] == customer) & (sap[COL_AMOUNT] > 0)][COL_AMOUNT].sum()), 2)
+    if rec.payer and partners:
+        best = sorted(((fuzz.token_sort_ratio(rec.payer.upper(), p.upper()), p)
+                       for p in partners), key=lambda t: -t[0])
+        res.candidates = [f"{p} ({s:.0f})" for s, p in best[:3]]
+        res.trace.append({
+            "step": "Customer match (payer → SAP partner)", "result": "hit" if score >= REVIEW_SCORE else "miss",
+            "detail": (f"{customer} fuzzy {score:.0f}" if score >= REVIEW_SCORE
+                       else f"best {score:.0f} < {REVIEW_SCORE}" if customer
+                       else "advice names no payer"),
+        })
 
     if invoice_hits:
         res.status = "matched"
@@ -242,17 +264,23 @@ def reconcile_one(rec: PaymentRecord, sap: pd.DataFrame, partners: list[str]) ->
     for amt, row in items:
         explained, variance, basis = _amount_agrees(amt, rec.total_amount)
         if explained:
+            res.trace.append({"step": "Tier 2 — amount exact (±0.05)", "result": "hit",
+                              "detail": f"{str(row.get(COL_REF, ''))} of {amt:,.2f} ({basis})"})
             res.rows.append(_row_from_series(row, str(row[COL_REF]), rec.total_amount,
                                              method="amount_single", explained=True,
                                              variance=variance, basis=basis))
             res.status = "matched"
             return res
+    res.trace.append({"step": "Tier 2 — amount exact (±0.05)", "result": "miss",
+                      "detail": f"no single open item ≈ {rec.total_amount:,.2f} among {len(items)} item(s)"})
 
     # Prefer invoice-type (RV) open items for allocation; fall back to all items
     rv_items = [(a, r) for a, r in items if str(r.get(COL_TYP, "")).strip().upper() == "RV"]
     combo = _subset_sum(rv_items, rec.total_amount, node_limit=3_000_000) or \
         _subset_sum(items, rec.total_amount, node_limit=3_000_000)
     if combo:
+        res.trace.append({"step": "Tier 4 — subset-sum", "result": "hit",
+                          "detail": f"{len(combo)} open item(s) sum to {rec.total_amount:,.2f}"})
         for row in combo:
             res.rows.append(_row_from_series(row, str(row[COL_REF]), None,
                                              method="amount_subset", explained=True,
@@ -261,6 +289,8 @@ def reconcile_one(rec: PaymentRecord, sap: pd.DataFrame, partners: list[str]) ->
         res.issue = (f"Allocated {len(combo)} invoice(s) by amount subset-sum — "
                      f"verify against the advice PDF before posting")
         return res
+    res.trace.append({"step": "Tier 4 — subset-sum", "result": "miss",
+                      "detail": f"no combination of {len(items)} item(s) sums to {rec.total_amount:,.2f}"})
 
     res.status = "exception"
     res.residual = round((res.open_balance or 0) - rec.total_amount, 2)

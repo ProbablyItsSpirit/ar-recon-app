@@ -32,6 +32,16 @@ COLUMN_LEGEND: dict[str, str] = {
     "source": "File the record came from",
     "status": "Parsing result: ok / no_amounts (nothing readable) / needs_ai (image-only doc) / needs_password (locked PDF)",
     "notes": "Extra parsing notes",
+    "ageing": "SAP aging bucket of the matched open item",
+    "region": "SAP region/company code on the matched row",
+    "typ": "SAP item type (RV = invoice); used to prefer invoices for allocation",
+    "type_os": "SAP special GL / other-type indicator on the row",
+    "label": "AI triage verdict: payment_advice / bank_statement / other",
+    "reason": "AI's short reason for that verdict",
+    "thread_id": "Stable id linking this row to its thread and to saved decisions",
+    "Decision": "Your latest thread action (confirm / reassign / note)",
+    "Decided by": "Who recorded the decision",
+    "Note": "Notes you added in the thread view",
 }
 
 

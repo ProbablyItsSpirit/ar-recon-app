@@ -8,7 +8,18 @@ from dataclasses import dataclass, field
 import pandas as pd
 from rapidfuzz import fuzz
 
-from ..ingest.sap_dump import COL_AMOUNT, COL_DOC_DATE, COL_DOC_NO, COL_DUE, COL_PARTNER, COL_REF
+from ..ingest.sap_dump import (
+    COL_AGEING,
+    COL_AMOUNT,
+    COL_DOC_DATE,
+    COL_DOC_NO,
+    COL_DUE,
+    COL_PARTNER,
+    COL_REF,
+    COL_REGION,
+    COL_TYPE_OS,
+    COL_TYP,
+)
 from .reconcile import REVIEW_SCORE, _amount_agrees, _subset_sum
 
 # Channels seen in bank narration; remitter = segment after "<channel>-<bank ref>-"
@@ -67,6 +78,8 @@ class CRResult:
     open_balance: float | None = None
     residual: float | None = None
     rows: list[dict] = field(default_factory=list)
+    trace: list[dict] = field(default_factory=list)       # tier ladder for threads
+    candidates: list[str] = field(default_factory=list)   # scored customer variants
 
 
 def _matched_row(row: pd.Series, invoice_no: str, advice_net: float | None,
@@ -82,12 +95,18 @@ def _matched_row(row: pd.Series, invoice_no: str, advice_net: float | None,
         "doc_no": str(row.get(COL_DOC_NO, "")),
         "doc_date": str(row.get(COL_DOC_DATE, ""))[:10],
         "due_date": str(row.get(COL_DUE, ""))[:10],
+        "ageing": str(row.get(COL_AGEING, "")),
+        "region": str(row.get(COL_REGION, "")),
+        "typ": str(row.get(COL_TYP, "")),
+        "type_os": str(row.get(COL_TYPE_OS, "")),
     }
 
 
-def _try_customer(cand: pd.DataFrame, amount: float):
+def _try_customer(cand: pd.DataFrame, amount: float, trace: list[dict],
+                  name: str):
     """Try to place `amount` against one customer variant.
-    Returns (kind, rows, issue) where kind in receipt|single|subset|None."""
+    Returns (kind, rows, issue) where kind in receipt|single|subset|None.
+    Records every tier attempt in ``trace`` for the thread view."""
     invoices = cand[cand[COL_AMOUNT] > 0]
 
     # Tier 0: money may ALREADY sit in SAP as a pending-collection receipt row
@@ -95,25 +114,41 @@ def _try_customer(cand: pd.DataFrame, amount: float):
         (cand[COL_AMOUNT] < 0)
         & cand[COL_REF].astype(str).str.contains("CUSTOMER RECEIPT", case=False, na=False)
     ]
+    hit_row = None
     for _, row in receipts.iterrows():
         if abs(abs(float(row[COL_AMOUNT])) - amount) <= 0.05:
-            return "receipt", [_matched_row(row, str(row[COL_REF]), amount,
-                                            "sap_receipt", 0.0, "matches SAP pending receipt")], ""
+            hit_row = row
+            break
+    if hit_row is not None:
+        trace.append({"step": f"Tier 0 — SAP pending receipt ({name})", "result": "hit",
+                      "detail": f"pending receipt of {amount:,.2f} found"})
+        return "receipt", [_matched_row(hit_row, str(hit_row[COL_REF]), amount,
+                                        "sap_receipt", 0.0, "matches SAP pending receipt")], ""
+    trace.append({"step": f"Tier 0 — SAP pending receipt ({name})", "result": "miss",
+                  "detail": f"no pending receipt ≈ {amount:,.2f} ({len(receipts)} row(s) checked)"})
 
     items = [(float(r[COL_AMOUNT]), r) for _, r in invoices.iterrows()]
     for amt, row in items:
         explained, variance, basis = _amount_agrees(amt, amount)
         if explained:
+            trace.append({"step": f"Tier 1/2 — amount exact ({name})", "result": "hit",
+                          "detail": f"{str(row.get(COL_REF, ''))} of {amt:,.2f} ({basis})"})
             return "single", [_matched_row(row, str(row[COL_REF]), amount,
                                            "amount_single", variance, basis)], ""
+    trace.append({"step": f"Tier 1/2 — amount exact ({name})", "result": "miss",
+                  "detail": f"no single open item ≈ {amount:,.2f} among {len(items)} item(s)"})
 
     rv_items = [(a, r) for a, r in items if str(r.get("Typ", "")).strip().upper() == "RV"]
     combo = _subset_sum(rv_items, amount, node_limit=3_000_000) or \
         _subset_sum(items, amount, node_limit=3_000_000)
     if combo:
+        trace.append({"step": f"Tier 4 — subset-sum ({name})", "result": "hit",
+                      "detail": f"{len(combo)} open item(s) sum to {amount:,.2f}"})
         rows = [_matched_row(row, str(row[COL_REF]), None,
                              "amount_subset", None, "subset-sum allocation") for row in combo]
         return "subset", rows, f"Allocated {len(combo)} open item(s) by subset-sum — verify before posting"
+    trace.append({"step": f"Tier 4 — subset-sum ({name})", "result": "miss",
+                  "detail": f"no combination of {len(items)} item(s) sums to {amount:,.2f}"})
     return None, [], ""
 
 
@@ -121,14 +156,20 @@ def _match_one(txn: dict, sap: pd.DataFrame, partners: list[str],
                own_patterns: list[str]) -> CRResult:
     res = CRResult(txn=txn, remitter=extract_remitter(txn["description"]))
     amount = float(txn["amount"])
+    res.trace.append({"step": "Remitter extracted", "result": "info",
+                      "detail": res.remitter or "— nothing parseable in narration"})
 
     if is_own_transfer(res.remitter, own_patterns):
         res.category = "own"
         res.status = "own"
+        res.trace.append({"step": "Own-transfer check", "result": "own",
+                          "detail": "remitter matches company pattern — no SAP match needed"})
         return res
 
     if not res.remitter:
         res.issue = "Cannot parse remitter from description — manual check"
+        res.trace.append({"step": "Own-transfer check", "result": "miss",
+                          "detail": "no remitter to score against customers"})
         return res
 
     # Score every partner; try the best few (customers often have name variants)
@@ -137,6 +178,13 @@ def _match_one(txn: dict, sap: pd.DataFrame, partners: list[str],
         key=lambda t: -t[0],
     )
     candidates = [(s, p) for s, p in scored if s >= REVIEW_SCORE][:3]
+    res.candidates = [f"{p} ({s:.0f})" for s, p in scored[:3]]
+    res.trace.append({
+        "step": "Customer fuzzy scoring", "result": "hit" if candidates else "miss",
+        "detail": "; ".join(f"{p} {s:.0f}" for s, p in scored[:3]) + (
+            f" — top {len(candidates)} ≥ {REVIEW_SCORE} tried"
+            if candidates else f" — best {scored[0][0]:.0f} < {REVIEW_SCORE}"),
+    })
     if not candidates:
         res.issue = f"No customer match in SAP (best fuzzy score {scored[0][0]:.0f})"
         return res
@@ -149,7 +197,7 @@ def _match_one(txn: dict, sap: pd.DataFrame, partners: list[str],
     subset_fallback: tuple[list[dict], str] | None = None
     for score, name in candidates:
         cand = sap[sap[COL_PARTNER] == name]
-        kind, rows, issue = _try_customer(cand, amount)
+        kind, rows, issue = _try_customer(cand, amount, res.trace, name)
         if kind in ("receipt", "single"):
             res.rows, res.issue = rows, issue
             res.status = "matched"

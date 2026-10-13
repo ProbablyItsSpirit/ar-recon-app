@@ -67,9 +67,13 @@ class _AiLine(dict):
 
 @lru_cache(maxsize=1)
 def _api_key() -> str | None:
-    """Resolve the NVIDIA API key (env var → Streamlit secrets → None)."""
+    """Resolve the NVIDIA API key (env var → Streamlit secrets → None).
+
+    Placeholder values (``CHANGE_ME``…) are treated as absent so local
+    example configs degrade to the no-AI path instead of firing doomed calls.
+    """
     key = (os.environ.get(KEY_ENV) or "").strip()
-    if key:
+    if key and not key.upper().startswith("CHANGE"):
         return key
     try:
         import streamlit as st
@@ -77,7 +81,9 @@ def _api_key() -> str | None:
         key = str(st.secrets["NVIDIA"]["api_key"]).strip()
     except Exception:
         return None
-    return key or None
+    if not key or key.upper().startswith("CHANGE"):
+        return None
+    return key
 
 
 @lru_cache(maxsize=1)

@@ -13,6 +13,7 @@ import email
 import email.header
 import email.policy
 import imaplib
+import re
 from pathlib import Path
 
 DEFAULT_KEYWORDS = [
@@ -54,8 +55,14 @@ def _subject_matches(subject: str, keywords: list[str]) -> bool:
 
 
 def fetch_mailbox(mb: dict, keywords: list[str], since_days: int, dest: Path,
-                  seen_ids: set[str]) -> tuple[list[Path], str]:
-    """Fetch one mailbox. Returns (saved_paths, human-readable status_message)."""
+                  seen_ids: set[str], fetch_scope: str = "keywords",
+                  max_mails: int = 300, max_kb: int = 10_240) -> tuple[list[Path], str]:
+    """Fetch one mailbox. Returns (saved_paths, human-readable status_message).
+
+    ``fetch_scope="all"`` saves every new INBOX mail (AI triage segregates
+    later); ``"keywords"`` keeps only advice-like subjects / PDF mails.
+    ``max_mails`` caps saves per run; ``max_kb`` skips oversized messages.
+    """
     address = str(mb.get("email", "")).strip()
     app_password = str(mb.get("app_password", "")).strip()
     if not address or not app_password or app_password.upper().startswith("CHANGE"):
@@ -81,7 +88,19 @@ def fetch_mailbox(mb: dict, keywords: list[str], since_days: int, dest: Path,
         return [], f"{address}: search failed"
 
     saved: list[Path] = []
+    kept = skipped_large = 0
     for num in (data[0].split() if data[0] else []):
+        if kept >= max_mails:
+            break
+        # size pre-check so a 50 MB attachment is never downloaded first
+        try:
+            _, sz = imap.fetch(num, "(RFC822.SIZE)")
+            size = int(re.search(rb"RFC822\.SIZE (\d+)", sz[0] or b"").group(1))
+        except Exception:
+            size = 0
+        if size > max_kb * 1024:
+            skipped_large += 1
+            continue
         typ, raw = imap.fetch(num, "(RFC822)")
         if typ != "OK":
             continue
@@ -96,8 +115,9 @@ def fetch_mailbox(mb: dict, keywords: list[str], since_days: int, dest: Path,
             if p.get_content_type() == "application/pdf"
             and p.get_filename()
         ]
-        if not (_subject_matches(subject, keywords) or pdf_parts):
+        if fetch_scope == "keywords" and not (_subject_matches(subject, keywords) or pdf_parts):
             continue
+        kept += 1
 
         # Save the .eml (envelope) plus any PDF advice attachments
         if msg_id:
@@ -113,13 +133,24 @@ def fetch_mailbox(mb: dict, keywords: list[str], since_days: int, dest: Path,
             pdf_path = dest / f"{stamp}_{tag}_{i}_{Path(fname).name}"
             pdf_path.write_bytes(payload)
             saved.append(pdf_path)
-        print(f"[mail] {address}: {subject[:60]!r} -> {len(saved)} file(s)")
+        if fetch_scope == "keywords":
+            print(f"[mail] {address}: {subject[:60]!r} -> {len(saved)} file(s)")
 
     try:
         imap.logout()
     except Exception:
         pass
-    return saved, f"{address}: {len(saved)} new file(s)"
+    status = f"{address}: {len(saved)} new file(s)"
+    if fetch_scope == "all":
+        status += f" (scope=all, {kept} mail(s) kept"
+        if skipped_large:
+            status += f", {skipped_large} too large (>{max_kb} KB)"
+        status += ")"
+    elif skipped_large:
+        status += f" ({skipped_large} too large)"
+    if kept >= max_mails:
+        status += f" — hit max_mails={max_mails} cap"
+    return saved, status
 
 
 def fetch_all(config_path: str = "config.toml", dest_dir: str = "input/mail",
@@ -145,10 +176,28 @@ def fetch_all(config_path: str = "config.toml", dest_dir: str = "input/mail",
 
     keywords = list(cfg.get("subject_keywords", DEFAULT_KEYWORDS))
     since_days = int(cfg.get("lookback_days", since_days))
+    scope = str(cfg.get("fetch_scope", "all")).strip().lower()
+    max_mails = int(cfg.get("max_mails", 300))
+    max_kb = int(cfg.get("max_mail_kb", 10_240))
+    if scope not in ("all", "keywords"):
+        scope = "keywords"
+    if scope == "all":
+        # fetch-all only makes sense with the AI triage gate behind it
+        try:
+            from ..extract.ai_triage import triage_available
+            ai_ok = triage_available()
+        except Exception:
+            ai_ok = False
+        if not ai_ok:
+            scope = "keywords"
+            logs.append("[triage] NVIDIA key not found - fetch reverted to keyword filter")
+    logs.append(f"[mail] scope={scope}, lookback={since_days}d, max_mails={max_mails}")
     saved: list[Path] = []
     for mb in cfg.get("mailboxes", []):
         try:
-            paths, status = fetch_mailbox(mb, keywords, since_days, dest, seen_ids)
+            paths, status = fetch_mailbox(mb, keywords, since_days, dest, seen_ids,
+                                          fetch_scope=scope, max_mails=max_mails,
+                                          max_kb=max_kb)
             saved += paths
             logs.append(status)
         except Exception as exc:
