@@ -22,9 +22,13 @@ from pathlib import Path
 from typing import IO
 
 import pandas as pd
-from openpyxl import Workbook
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.utils import get_column_letter
+
+try:  # openpyxl is only needed when writing the workbook — never at boot
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+except Exception:  # Excel export degrades with a clear message instead of crashing
+    Workbook = None  # type: ignore[assignment]
 
 TITLE_BG, HEADER_BG = "1F3864", "2F5597"
 BAND, SECTION_BG, KPI_BG = "F2F6FC", "DDEBF7", "D9E1F2"
@@ -313,6 +317,9 @@ def _write_summary(ws, df: pd.DataFrame, sheets: dict[str, pd.DataFrame]) -> Non
 def write_report(sheets: dict[str, pd.DataFrame],
                  target: str | Path | IO[bytes]) -> "Path | None":
     """Write all sheets styled to ``target`` (path or file-like). Returns the path."""
+    if Workbook is None:
+        raise RuntimeError("openpyxl is unavailable — Excel export disabled "
+                           "(pip install 'openpyxl>=3.1,<4')")
     wb = Workbook()
     wb.remove(wb.active)
     for name, raw in sheets.items():

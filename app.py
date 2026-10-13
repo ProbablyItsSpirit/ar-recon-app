@@ -16,12 +16,21 @@ import streamlit as st
 st.set_page_config(page_title="AR Reconciliation", page_icon="💳", layout="wide")
 
 from src.auth import logout_button, require_auth  # noqa: E402
-from src.decisions import (add_decision, load_decisions,  # noqa: E402
-                           merge_import, merge_into_sheets, save_decisions)
-from src.legend import render_legend  # noqa: E402
-from src.pipeline import (_style_own_sheets, load_threads, run_advice_mode,  # noqa: E402
-                          run_bank_mode)
-from src.report.xlsx_report import write_report  # noqa: E402
+
+try:
+    from src.decisions import (add_decision, load_decisions,  # noqa: E402
+                               merge_import, merge_into_sheets, save_decisions)
+    from src.legend import render_legend  # noqa: E402
+    from src.pipeline import (_style_own_sheets, load_threads, run_advice_mode,  # noqa: E402
+                              run_bank_mode)
+    from src.report.xlsx_report import write_report  # noqa: E402
+except Exception:  # Streamlit Cloud redacts its error page — show the real one
+    import traceback
+
+    require_auth()
+    st.title("⚠️ Startup error")
+    st.code(traceback.format_exc())
+    st.stop()
 
 require_auth()
 
@@ -253,14 +262,17 @@ def _show_results(sheets: dict[str, pd.DataFrame], xlsx_path: Path,
     st.divider()
     _decisions_bar(decisions)
 
-    buf = io.BytesIO()
-    write_report(sheets, buf)  # download always reflects saved decisions
-    st.download_button(
-        "⬇ Download Excel report",
-        data=buf.getvalue(),
-        file_name=xlsx_path.name,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    try:  # download always reflects saved decisions
+        buf = io.BytesIO()
+        write_report(sheets, buf)
+        st.download_button(
+            "⬇ Download Excel report",
+            data=buf.getvalue(),
+            file_name=xlsx_path.name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    except Exception as exc:
+        st.warning(f"Excel download unavailable: {exc}")
 
 
 def _own_patterns() -> list[str] | None:
